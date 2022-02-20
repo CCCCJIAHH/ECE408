@@ -2,79 +2,101 @@
 #include <iostream>
 #include "gpu-new-forward.h"
 #define TILE_WIDTH 16
-#define CUDA_MAX_NUM_THREADS 1024
 
-// optimization 4: input unroll and shared memory
+__global__ void conv_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
+{
+  /*
+  Modify this function to implement the forward pass described in Chapter 16.
+  We have added an additional dimension to the tensors to support an entire mini-batch
+  The goal here is to be correct AND fast.
 
+  Function paramter definitions:
+  y - output
+  x - input
+  k - kernel
+  B - batch_size (number of images in x)
+  M - number of output feature maps
+  C - number of input feature maps
+  H - input height dimension
+  W - input width dimension
+  K - kernel height and width (K x K)
+  */
 
+  // We have some nice #defs for you below to simplify indexing. Feel free to use them, or create your own.
+  // An example use of these macros:
+  // float a = y4d(0,0,0,0)
+  // y4d(0,0,0,0) = a
 
-__global__ void unroll_kernel(const float* x, float* X_unroll, int b, int C, int H, int W, int K){
+#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
 #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-  int t = blockIdx.x * CUDA_MAX_NUM_THREADS + threadIdx.x;
-  int H_out = H - K + 1;
-  int W_out = W - K + 1;
-  int W_unroll = H_out * W_out;
-
-  if(t < C * W_unroll) {
-    int c = t / W_unroll;
-    int s = t % W_unroll;
-    int h_out = s / W_out;
-    int w_out = s % W_out;
-    int h_unroll = h_out * W_out + w_out;
-    int w_base = c*K*K;
-    for(int p = 0; p < K; p++) {
-      for(int q = 0; q < K; q++) {
-        int w_unroll = w_base + p * K + q;
-        X_unroll[w_unroll * W_unroll + h_unroll] = x4d(b, c, h_out+p, w_out+q);
-      }
-    }
-  }
-#undef x4d
-}
-
-__global__ void matrixMultiplyShared(const float *A, const float *B, float *C,
-                                     int numARows, int numAColumns,
-                                     int numBRows, int numBColumns,
-                                     int numCRows, int numCColumns) {
-  
-  __shared__ float subTileA[TILE_WIDTH][TILE_WIDTH];  // must constant parameter
-  __shared__ float subTileB[TILE_WIDTH][TILE_WIDTH];
+#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
     
-  int bx = blockIdx.x;
-  int by = blockIdx.y;
-  
+  __shared__ float W_shared[TILE_WIDTH][TILE_WIDTH];
+  __shared__ float X_shared[TILE_WIDTH][TILE_WIDTH];
+
+  const int H_out = H - K + 1;
+  const int W_out = W - K + 1;
+
+  int bz = blockIdx.z;
   int tx = threadIdx.x;
   int ty = threadIdx.y;
-  
-  int row = by * TILE_WIDTH + ty;
-  int col = bx * TILE_WIDTH + tx;
-  
-  float cValue = 0;
-  for (int q = 0; q < (numAColumns - 1)/TILE_WIDTH + 1; ++q) {
-    
-    if (row < numARows && ((q*TILE_WIDTH+tx) < numAColumns)) {  // still in A's range
-      subTileA[ty][tx] = A[row*numAColumns + q*TILE_WIDTH+tx];
-    } else {
-      subTileA[ty][tx] = 0;
+  int row = blockIdx.y * TILE_WIDTH + ty;
+  int column = blockIdx.x * TILE_WIDTH + tx;
+  int unroll_column = C * K * K;
+
+  float acc = 0.0;
+  int iterations = ceil(1.0 * unroll_column / TILE_WIDTH);
+
+  for (int i = 0; i < iterations; i++) {
+    W_shared[ty][tx] = 0;
+    X_shared[ty][tx] = 0;
+
+    int absolute_x = i * TILE_WIDTH + tx;
+    int absolute_y = i * TILE_WIDTH + ty;
+
+    int W_m = row;
+    int W_c = absolute_x / (K * K);
+    int W_h = (absolute_x % (K * K)) / K;
+    int W_w = (absolute_x % (K * K)) % K;
+
+    if ((absolute_x < unroll_column) && (row < M)){
+      W_shared[ty][tx] = k4d(W_m, W_c, W_h, W_w);
     }
-    if (q*TILE_WIDTH+ty < numBRows && (col < numBColumns)) {  // still in B's range
-      subTileB[ty][tx] = B[(q*TILE_WIDTH+ty)*numBColumns + col];
-    } else {
-      subTileB[ty][tx] = 0;
+    else{
+      W_shared[ty][tx] = 0;
+    }
+
+    int X_n = bz;
+    int X_c = absolute_y / (K * K);
+    int X_p = (absolute_y % (K * K)) / K;
+    int X_q = (absolute_y % (K * K)) % K;
+    int X_h = column / W_out;
+    int X_w = column % W_out;
+    if (absolute_y < unroll_column && column < H_out * W_out){
+      X_shared[ty][tx] = x4d(X_n, X_c, X_h + X_p, X_w + X_q);
+    }
+    else{
+      X_shared[ty][tx] = 0;
     }
     __syncthreads();
-        
-    if (row < numCRows && col < numCColumns){  // in C's range
-      for (int k=0; k<TILE_WIDTH; ++k)
-        cValue += subTileA[ty][k] * subTileB[k][tx];  // store temp_value in cValue, need to consider halo cells
+
+    for (int q = 0; q < TILE_WIDTH; q++){
+      acc += W_shared[ty][q] * X_shared[q][tx];
     }
     __syncthreads();
   }
+
+  int Y_n = bz;
+  int Y_m = row;
+  int Y_h = column / W_out;
+  int Y_w = column % W_out;
+  if (row < M && column < W_out * H_out)
+    y4d(Y_n, Y_m, Y_h, Y_w) = acc;
   
-  if ((row < numCRows) && (col<numCColumns)) {
-    C[row*numCColumns + col] = cValue;
-  }
-  
+#undef y4d
+#undef x4d
+#undef k4d
+
 }
 
 
@@ -109,26 +131,16 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_y, const f
 __host__ void GPUInterface::conv_forward_gpu(float *device_y, const float *device_x, const float *device_k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
   // Set the kernel dimensions and call the kernel
-  // chapter16, P20
-  const int W_out = W - K + 1;
+  // can we define inside a function, or should we just define outside?
+
+  // why we need to use const here? can we use int directly?
+  // chapter16, P13
   const int H_out = H - K + 1;
-  int W_unroll = H_out * W_out;
-  int H_unroll = C * K * K;
-  float* X_unrolled;
-  cudaMalloc((void **) &X_unrolled, W_unroll * H_unroll * sizeof(float));
-  // block num for unroll_kernel
-  int num_blocks = ceil(1.0 * C * H_out * W_out / CUDA_MAX_NUM_THREADS);
+  const int W_out = W - K + 1;
+  dim3 gridDim(ceil(1.0 * H_out * W_out / TILE_WIDTH), ceil(1.0 * M / TILE_WIDTH), B);
+  dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
+  conv_forward_kernel<<<gridDim, blockDim>>>(device_y, device_x, device_k, B, M, C, H, W, K);
 
-  dim3 dimGrid(ceil(1.0 * W_unroll / TILE_WIDTH), ceil(1.0 * M / TILE_WIDTH), 1);
-  dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
-
-  for(int n = 0; n < B; n++) {
-    unroll_kernel<<<num_blocks, CUDA_MAX_NUM_THREADS>>>(device_x, X_unrolled, n, C, H, W, K);
-    cudaDeviceSynchronize();
-    matrixMultiplyShared<<<dimGrid, dimBlock>>>(device_k, X_unrolled, &device_y[n * M * H_out * W_out], 
-                                                M,H_unroll, H_unroll, W_unroll, M, W_unroll);
-    cudaDeviceSynchronize();
-  }
 }
 
 
